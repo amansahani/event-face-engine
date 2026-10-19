@@ -26,6 +26,7 @@ pub enum RecognitionModelType {
 pub struct FaceEngine {
     _env: Arc<Environment>,
     detector_session: Option<Arc<Mutex<Session>>>,
+    detector_input_name: String,
     arcface_session: Arc<Mutex<Session>>,
     vggface_session: Option<Arc<Mutex<Session>>>,
     pub execution_target: String,
@@ -89,16 +90,19 @@ impl FaceEngine {
         ));
 
         // 2. Initialize SCRFD Detector Session (if available)
-        let detector_session = if std::path::Path::new(detector_path).exists() {
+        let (detector_session, detector_input_name) = if std::path::Path::new(detector_path).exists() {
             match create_builder()?.commit_from_file(detector_path) {
-                Ok(s) => Some(Arc::new(Mutex::new(s))),
+                Ok(s) => {
+                    let input_name = s.inputs()[0].name().to_string();
+                    (Some(Arc::new(Mutex::new(s))), input_name)
+                }
                 Err(e) => {
                     tracing::warn!("Detector failed to load: {:?}. Proceeding with fallback.", e);
-                    None
+                    (None, "blob".to_string())
                 }
             }
         } else {
-            None
+            (None, "blob".to_string())
         };
 
         // 3. Initialize VGGFace2 Fast Session (if available)
@@ -119,6 +123,7 @@ impl FaceEngine {
         Ok(Self {
             _env: env,
             detector_session,
+            detector_input_name,
             arcface_session,
             vggface_session,
             execution_target,
@@ -195,24 +200,31 @@ impl FaceEngine {
 
         let shape = vec![1i64, 3, 640, 640];
         let tensor = Tensor::from_array((shape, tensor_buf.into_boxed_slice()))?;
-        let inputs = ort::inputs!["input.1" => tensor];
-
+        
         let mut sess = detector_mutex.lock().unwrap();
-        let outputs = sess.run(inputs)?;
+        let outputs = if self.detector_input_name == "blob" {
+            sess.run(ort::inputs!["blob" => tensor])?
+        } else {
+            sess.run(ort::inputs!["input.1" => tensor])?
+        };
 
-        // Parse SCRFD Strides: 8, 16, 32
-        // Output indices:
-        // scores: 0 (stride 8), 1 (stride 16), 2 (stride 32)
-        // bboxes: 3 (stride 8), 4 (stride 16), 5 (stride 32)
-        // kps:    6 (stride 8), 7 (stride 16), 8 (stride 32)
         let strides = [8usize, 16, 32];
         let mut candidates: Vec<DetectedFace> = Vec::new();
+        let is_10g = self.detector_input_name == "blob";
 
         for i in 0..3 {
-            let (_, scores_slice) = outputs[i]
+            // In 10G: index i*3 is box, i*3+1 is score
+            // In 2.5G: index i is score, index i+3 is box
+            let (score_idx, box_idx) = if is_10g {
+                (i * 3 + 1, i * 3)
+            } else {
+                (i, i + 3)
+            };
+
+            let (_, scores_slice) = outputs[score_idx]
                 .try_extract_tensor::<f32>()
                 .context("Failed extracting score tensor")?;
-            let (_, bbox_slice) = outputs[i + 3]
+            let (_, bbox_slice) = outputs[box_idx]
                 .try_extract_tensor::<f32>()
                 .context("Failed extracting bbox tensor")?;
 

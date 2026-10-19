@@ -1,13 +1,13 @@
 # Event Face Engine 🦀
 
-High-performance, hardware-agnostic, multi-model face matching & event photo distribution engine written in **Rust**, powered by **Axum**, **ONNX Runtime (C API)**, **SCRFD-2.5G Multi-Face Detection**, **ArcFace W600K**, and **SQLite SIMD Vector Search**.
+High-performance, hardware-agnostic, multi-model face matching & event photo distribution engine written in **Rust**, powered by **Axum**, **ONNX Runtime (C API)**, **SCRFD-10G Multi-Face Detection**, **ArcFace W600K**, and **SQLite SIMD Vector Search**.
 
 ---
 
 ## ⚡ Key Highlights & Production Accuracy
 
 - **High-Accuracy Multi-Model Ensemble**:
-  - **SCRFD-2.5G**: Detects all faces across crowded event photos (down to tiny $16\times 16$ px background faces) with non-maximum suppression (NMS).
+  - **SCRFD-10G (SOTA Event Crowd Detector)**: Detects all faces across crowded event photos (down to tiny $16\times 16$ px background faces at **83.5% WIDER FACE Hard AP**) with non-maximum suppression (NMS).
   - **ArcFace (ResNet-50 WebFace600K)**: Eliminates false negatives in low-light/nightclub photos ($20\%$ exposure), maintaining positive identification ($0.65+$ similarity vs $0.05$ for impostors) where older models fail.
   - **Dynamic Low-Light Enhancement**: CIELAB luminance detection ($L < 80.0$) with non-linear shadow lift to preserve chromatic features before embedding extraction.
 - **Hardware-Agnostic Silicon Acceleration**:

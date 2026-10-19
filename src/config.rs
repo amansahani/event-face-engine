@@ -38,7 +38,7 @@ impl Default for AppConfig {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080),
             detector_model_path: env::var("DETECTOR_MODEL_PATH")
-                .unwrap_or_else(|_| "models/scrfd_2.5g_bnkps.onnx".to_string()),
+                .unwrap_or_else(|_| "models/scrfd_10g_gnkps.onnx".to_string()),
             primary_model_path: env::var("PRIMARY_MODEL_PATH")
                 .unwrap_or_else(|_| "models/arcface_w600k_r50.onnx".to_string()),
             fast_model_path: env::var("FAST_MODEL_PATH")
