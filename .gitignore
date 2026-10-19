@@ -1,0 +1,10 @@
+target/
+data/
+models/*.onnx
+models/*.pt
+models/*.h5
+models/*.pth
+*.db
+*.db-journal
+.env
+.env.*
