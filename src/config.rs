@@ -10,6 +10,11 @@ pub struct AppConfig {
     pub fast_model_path: String,
     pub db_path: String,
     pub photos_dir: String,
+    pub storage_backend: String, // "local", "s3", "minio", "r2"
+    pub s3_endpoint: Option<String>,
+    pub s3_bucket: Option<String>,
+    pub s3_access_key: Option<String>,
+    pub s3_secret_key: Option<String>,
     pub prefer_device: DevicePreference,
     pub intra_threads: usize,
     pub similarity_threshold: f32,
@@ -42,6 +47,12 @@ impl Default for AppConfig {
                 .unwrap_or_else(|_| "data/event_face.db".to_string()),
             photos_dir: env::var("PHOTOS_DIR")
                 .unwrap_or_else(|_| "data/photos".to_string()),
+            storage_backend: env::var("STORAGE_BACKEND")
+                .unwrap_or_else(|_| "local".to_string()),
+            s3_endpoint: env::var("S3_ENDPOINT").ok(),
+            s3_bucket: env::var("S3_BUCKET").ok(),
+            s3_access_key: env::var("S3_ACCESS_KEY").ok(),
+            s3_secret_key: env::var("S3_SECRET_KEY").ok(),
             prefer_device: match env::var("DEVICE").unwrap_or_default().to_lowercase().as_str() {
                 "cuda" | "gpu" => DevicePreference::Cuda,
                 "cpu" => DevicePreference::Cpu,

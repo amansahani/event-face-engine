@@ -27,3 +27,4 @@ ndarray = "0.15"
 # Fast SIMD Image processing
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 fast_image_resize = { version = "4.2", features = ["image"] }
+reqwest = { version = "0.13.5", features = ["blocking", "multipart"] }

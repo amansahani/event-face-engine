@@ -16,7 +16,7 @@ use db::sqlite_store::SqliteVectorStore;
 use engine::FaceEngine;
 use serde::Serialize;
 use std::sync::Arc;
-use storage::{LocalStorage, StorageBackend};
+use storage::{LocalStorage, S3Storage, StorageBackend};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -79,8 +79,24 @@ async fn main() -> Result<()> {
     // 3. Initialize SQLite Vector Store
     let db = SqliteVectorStore::new(&config.db_path)?;
 
-    // 4. Initialize Storage Backend
-    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(&config.photos_dir)?);
+    // 4. Initialize Decoupled Storage Backend (Local FS, S3, MinIO, or Cloudflare R2)
+    let storage: Arc<dyn StorageBackend> = match config.storage_backend.to_lowercase().as_str() {
+        "s3" | "minio" | "r2" => {
+            let endpoint = config.s3_endpoint.clone().unwrap_or_else(|| "http://localhost:9000".to_string());
+            let bucket = config.s3_bucket.clone().unwrap_or_else(|| "event-photos".to_string());
+            tracing::info!("Initializing S3-compatible storage backend [Endpoint: {}, Bucket: {}]", endpoint, bucket);
+            Arc::new(S3Storage::new(
+                &endpoint,
+                &bucket,
+                config.s3_access_key.clone(),
+                config.s3_secret_key.clone(),
+            )?)
+        }
+        _ => {
+            tracing::info!("Initializing Local POSIX filesystem storage [Dir: {}]", config.photos_dir);
+            Arc::new(LocalStorage::new(&config.photos_dir)?)
+        }
+    };
 
     let state = AppState {
         db,
@@ -116,6 +132,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         "threads": state.config.intra_threads,
         "low_light_threshold": state.config.low_light_threshold,
         "similarity_threshold": state.config.similarity_threshold,
+        "storage_backend": state.config.storage_backend,
         "storage_dir": state.config.photos_dir,
     }))
 }
