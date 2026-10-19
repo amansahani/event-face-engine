@@ -102,8 +102,8 @@ flowchart TD
 
     CropLoop --> LumCalc
     LumCalc --> LumBranch
-    LumBranch -->|Yes (Night / Dark)| LowLightCurve
-    LumBranch -->|No (Daylight)| StandardCrop
+    LumBranch -->|"Yes: Night / Dark"| LowLightCurve
+    LumBranch -->|"No: Daylight"| StandardCrop
 
     LowLightCurve --> ArcFaceCrop
     StandardCrop --> ArcFaceCrop
