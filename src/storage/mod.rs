@@ -106,3 +106,59 @@ impl StorageBackend for S3Storage {
         format!("{}/{}/{}", self.endpoint, self.bucket, clean_key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_local_storage_lifecycle() -> Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("test_event_storage_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+        let storage = LocalStorage::new(temp_dir.to_str().unwrap())?;
+
+        let sample_key = "wedding_2026/photo_001.jpg";
+        let sample_bytes = b"EXIF_JPEG_RAW_BYTES_TEST_12345";
+
+        // 1. Write bytes
+        let written_key = storage.write_bytes(sample_key, sample_bytes)?;
+        assert_eq!(written_key, sample_key);
+
+        // 2. Read bytes
+        let read_back = storage.read_bytes(sample_key)?;
+        assert_eq!(read_back, sample_bytes);
+
+        // 3. Verify URL format
+        let url = storage.get_url(sample_key);
+        assert_eq!(url, "/static/photos/wedding_2026/photo_001.jpg");
+
+        // 4. Nested directory auto-creation test
+        let nested_key = "nested/subfolder/test.png";
+        storage.write_bytes(nested_key, b"PNG_DATA")?;
+        assert_eq!(storage.read_bytes(nested_key)?, b"PNG_DATA");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_s3_storage_url_formatting() -> Result<()> {
+        let storage = S3Storage::new(
+            "http://127.0.0.1:9000",
+            "event-photos",
+            Some("minioadmin".to_string()),
+            Some("minioadmin".to_string()),
+        )?;
+
+        let key = "tech_summit/speaker.jpg";
+        let url = storage.get_url(key);
+        assert_eq!(url, "http://127.0.0.1:9000/event-photos/tech_summit/speaker.jpg");
+
+        // Test with leading slash
+        let url_leading = storage.get_url("/tech_summit/speaker.jpg");
+        assert_eq!(url_leading, "http://127.0.0.1:9000/event-photos/tech_summit/speaker.jpg");
+
+        Ok(())
+    }
+}
+
