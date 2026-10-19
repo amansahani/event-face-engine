@@ -5,12 +5,15 @@ use std::env;
 pub struct AppConfig {
     pub server_host: String,
     pub server_port: u16,
-    pub model_path: String,
+    pub detector_model_path: String,
+    pub primary_model_path: String,
+    pub fast_model_path: String,
     pub db_path: String,
     pub photos_dir: String,
     pub prefer_device: DevicePreference,
     pub intra_threads: usize,
     pub similarity_threshold: f32,
+    pub low_light_threshold: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -29,7 +32,11 @@ impl Default for AppConfig {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080),
-            model_path: env::var("MODEL_PATH")
+            detector_model_path: env::var("DETECTOR_MODEL_PATH")
+                .unwrap_or_else(|_| "models/scrfd_2.5g_bnkps.onnx".to_string()),
+            primary_model_path: env::var("PRIMARY_MODEL_PATH")
+                .unwrap_or_else(|_| "models/arcface_w600k_r50.onnx".to_string()),
+            fast_model_path: env::var("FAST_MODEL_PATH")
                 .unwrap_or_else(|_| "models/vggface2_facenet_fp32.onnx".to_string()),
             db_path: env::var("DB_PATH")
                 .unwrap_or_else(|_| "data/event_face.db".to_string()),
@@ -51,6 +58,10 @@ impl Default for AppConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.60),
+            low_light_threshold: env::var("LOW_LIGHT_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(80.0),
         }
     }
 }

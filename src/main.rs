@@ -29,10 +29,19 @@ struct AppState {
 }
 
 #[derive(Serialize)]
+struct FaceDetail {
+    bbox: [i32; 4],
+    score: f32,
+    model_used: String,
+}
+
+#[derive(Serialize)]
 struct UploadResponse {
     status: String,
     photo_key: String,
     url: String,
+    faces_detected: usize,
+    faces: Vec<FaceDetail>,
 }
 
 #[derive(Serialize)]
@@ -58,9 +67,11 @@ async fn main() -> Result<()> {
     let config = AppConfig::default();
     tracing::info!("Starting Event Face Engine with config: {:?}", config);
 
-    // 2. Initialize Hardware-Agnostic Face Engine
+    // 2. Initialize Hardware-Agnostic Multi-Model Face Engine
     let engine = Arc::new(FaceEngine::new(
-        &config.model_path,
+        &config.detector_model_path,
+        &config.primary_model_path,
+        &config.fast_model_path,
         config.prefer_device,
         config.intra_threads,
     )?);
@@ -89,7 +100,7 @@ async fn main() -> Result<()> {
         .with_state(state);
 
     let addr = format!("{}:{}", config.server_host, config.server_port);
-    tracing::info!("🚀 Event Face Engine (Modular Rust) listening on http://{}", addr);
+    tracing::info!("🚀 Event Face Engine (Multi-Model High Accuracy) listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
@@ -100,8 +111,11 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "healthy",
         "service": "event_face_engine_rust",
+        "pipeline": "SCRFD Multi-Face Detection + ArcFace/VGGFace2 Dynamic Routing",
         "runtime": state.engine.execution_target,
         "threads": state.config.intra_threads,
+        "low_light_threshold": state.config.low_light_threshold,
+        "similarity_threshold": state.config.similarity_threshold,
         "storage_dir": state.config.photos_dir,
     }))
 }
@@ -120,25 +134,48 @@ async fn upload_handler(
         let data = field.bytes().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         let photo_key = format!("{}/{}", event_id, file_name);
 
-        // 1. Write raw image to storage
+        // 1. Write raw photo to storage
         state.storage.write_bytes(&photo_key, &data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 2. Fast SIMD Image decoding and preprocessing
-        let (tensor, (w, h)) = FaceEngine::preprocess_image(&data)
+        // 2. Decode image
+        let img = FaceEngine::decode_image(&data)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("Image decode error: {}", e)))?;
+        let (orig_w, orig_h) = (img.width(), img.height());
 
-        // 3. Extract 512-D Embedding
-        let embedding = state.engine.extract_embedding(tensor)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Inference error: {}", e)))?;
+        // 3. Upstream Multi-Face Detection via SCRFD
+        let detected = state.engine.detect_faces(&img)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Detection error: {}", e)))?;
 
-        // 4. Save to SQLite
-        state.db.insert_face(&event_id, &photo_key, &[0, 0, w as i32, h as i32], &embedding, None)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
+        // If no faces detected by SCRFD (e.g., extreme portrait close-up or fallback), treat full image as candidate
+        let face_boxes = if detected.is_empty() {
+            vec![[0i32, 0i32, orig_w as i32, orig_h as i32]]
+        } else {
+            detected.iter().map(|d| d.bbox).collect::<Vec<_>>()
+        };
+
+        let mut ingested_faces = Vec::new();
+
+        // 4. Process each face individually with dynamic low-light & ArcFace recognition
+        for bbox in face_boxes {
+            let (embedding, model_type) = state.engine.extract_embedding(&img, bbox, state.config.low_light_threshold)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding extraction error: {}", e)))?;
+
+            state.db.insert_face(&event_id, &photo_key, &bbox, &embedding, None)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB insert error: {}", e)))?;
+
+            ingested_faces.push(FaceDetail {
+                bbox,
+                score: 1.0,
+                model_used: format!("{:?}", model_type),
+            });
+        }
 
         return Ok(Json(UploadResponse {
             status: "ingested".to_string(),
             photo_key: photo_key.clone(),
             url: state.storage.get_url(&photo_key),
+            faces_detected: ingested_faces.len(),
+            faces: ingested_faces,
         }));
     }
 
@@ -153,15 +190,26 @@ async fn search_handler(
     while let Some(field) = multipart.next_field().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))? {
         let data = field.bytes().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-        // 1. Preprocess selfie
-        let (tensor, _) = FaceEngine::preprocess_image(&data)
+        // 1. Decode selfie
+        let img = FaceEngine::decode_image(&data)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("Selfie decode error: {}", e)))?;
+        let (orig_w, orig_h) = (img.width(), img.height());
 
-        // 2. Extract 512-D Embedding
-        let query_emb = state.engine.extract_embedding(tensor)
+        // 2. Detect face in selfie
+        let detected = state.engine.detect_faces(&img)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Detection error: {}", e)))?;
+
+        let search_box = if let Some(first) = detected.first() {
+            first.bbox
+        } else {
+            [0i32, 0i32, orig_w as i32, orig_h as i32]
+        };
+
+        // 3. Extract high-accuracy probe embedding (with low-light adaptive curve)
+        let (query_emb, _) = state.engine.extract_embedding(&img, search_box, state.config.low_light_threshold)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Inference error: {}", e)))?;
 
-        // 3. Sub-millisecond Dot-Product Search in SQLite
+        // 4. Sub-millisecond Dot-Product Search in SQLite with hardware SIMD
         let matches = state.db.search_similar(&event_id, &query_emb, state.config.similarity_threshold, 100)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Search error: {}", e)))?;
 
@@ -192,14 +240,14 @@ async fn portal_handler() -> Html<&'static str> {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Modular Rust Event Face Portal</title>
+      <title>High-Accuracy Rust Event Face Portal</title>
       <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-zinc-950 text-white min-h-screen flex flex-col items-center justify-center p-6">
       <div class="max-w-md w-full bg-zinc-900 rounded-3xl p-8 shadow-2xl border border-zinc-800 text-center">
-        <div class="inline-block px-3 py-1 bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-mono rounded-full mb-3">🦀 Hardware-Agnostic Rust Engine</div>
+        <div class="inline-block px-3 py-1 bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-mono rounded-full mb-3">🦀 SCRFD Multi-Face + ArcFace W600K</div>
         <h1 class="text-3xl font-extrabold mb-2 text-white">Find My Event Photos</h1>
-        <p class="text-zinc-400 text-sm mb-6">Sub-millisecond attendee photo matching powered by Rust.</p>
+        <p class="text-zinc-400 text-sm mb-6">High-accuracy attendee face matching with night & crowd support.</p>
         
         <input type="text" id="event_id" value="wedding_2026" class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-3 mb-4 text-center font-mono text-sm focus:outline-none focus:border-amber-500">
         

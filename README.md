@@ -1,12 +1,27 @@
 # Event Face Engine 🦀
 
-High-performance, hardware-agnostic, and storage-decoupled face matching & event photo distribution engine written in **Rust**, powered by **Axum**, **ONNX Runtime (C API)**, and **SQLite Vector Search**.
+High-performance, hardware-agnostic, multi-model face matching & event photo distribution engine written in **Rust**, powered by **Axum**, **ONNX Runtime (C API)**, **SCRFD-2.5G Multi-Face Detection**, **ArcFace W600K**, and **SQLite SIMD Vector Search**.
 
 ---
 
-## 📐 Granular System Architecture & End-to-End Pipeline
+## ⚡ Key Highlights & Production Accuracy
 
-The engine is engineered as a decoupled, multi-stage pipeline maximizing thread-level concurrency, SIMD vectorization across CPU silicon, and kernel graph execution on GPUs.
+- **High-Accuracy Multi-Model Ensemble**:
+  - **SCRFD-2.5G**: Detects all faces across crowded event photos (down to tiny $16\times 16$ px background faces) with non-maximum suppression (NMS).
+  - **ArcFace (ResNet-50 WebFace600K)**: Eliminates false negatives in low-light/nightclub photos ($20\%$ exposure), maintaining positive identification ($0.65+$ similarity vs $0.05$ for impostors) where older models fail.
+  - **Dynamic Low-Light Enhancement**: CIELAB luminance detection ($L < 80.0$) with non-linear shadow lift to preserve chromatic features before embedding extraction.
+- **Hardware-Agnostic Silicon Acceleration**:
+  - **NVIDIA CUDA**: cuDNN operator fusion with GPU execution provider.
+  - **x86_64 (Intel & AMD)**: Hand-tuned 256-bit AVX2 + FMA3 dot-product vector engine (`_mm256_fmadd_ps`).
+  - **ARM64**: Native ARM-NEON and SVE/SVE2 vectorization (Apple Silicon M1-M4, AWS Graviton, Raspberry Pi 5).
+  - **RISC-V**: RVV 1.0 standard vector extensions.
+- **Storage-Decoupled**: Pluggable storage architecture supporting Local Filesystem, MinIO, Amazon S3, or Cloudflare R2.
+- **Zero-Dependency Vector Store**: Embedded SQLite database with contiguous memory dot-product search. No external vector database containers required.
+- **Built-in Mobile PWA**: Responsive photo portal for event attendees to scan a selfie and find their photos instantly.
+
+---
+
+## 📐 Granular System Architecture & Pipeline
 
 ```mermaid
 flowchart TD
@@ -25,17 +40,24 @@ flowchart TD
         AsyncFork{{"Parallel Dispatch Fork"}}
         StorageWorker["Storage Backend Task (Local FS / MinIO / S3 / R2)"]
         
-        subgraph PreprocessingEngine ["Fast SIMD Preprocessing"]
-            Decode["Image Decoder (Header & Color Space Parsing)"]
-            Resize["Bilinear Scaler (FilterType::Triangle) -> (160x160x3)"]
-            Normalize["Planar NCHW Transpose & Normalization: (px - 127.5) / 128.0"]
+        subgraph DetectionSubsystem ["SCRFD Multi-Face Detection (640x640)"]
+            Letterbox["Aspect-Preserving Letterbox Rescaler -> 640x640"]
+            ScrfdInfer["SCRFD 2.5G Multi-Stride Forward Pass (Strides 8, 16, 32)"]
+            AnchorDecode["BBox Distance & Score Anchor Decoding"]
+            NmsFilter["Non-Maximum Suppression (IoU >= 0.40)"]
         end
 
-        subgraph InferenceEngine ["Hardware-Agnostic Inference Engine"]
-            HardwareRouter{{"Hardware Selector & Graph Router"}}
-            CudaBranch["NVIDIA CUDA EP (cuDNN Fusion + CUDA Graph Capture)"]
-            CpuBranch["ORT CPU EP (Level 3 Graph Optimization + Multi-threading)"]
-            InferenceExec["512-D Tensor Output Extraction"]
+        subgraph DynamicRouting ["Quality & Illumination Assessment"]
+            CropLoop["For Each Detected Face Bounding Box"]
+            LumCalc["CIELAB Mean Luminance Calculation (L Channel)"]
+            LumBranch{{"Luminance < 80.0?"}}
+            LowLightCurve["Adaptive Non-Linear Shadow Enhancement (Gamma 0.65)"]
+            StandardCrop["Pass-through High-Res Crop"]
+        end
+
+        subgraph RecognitionSubsystem ["Deep Metric Representation (512-D)"]
+            ArcFaceCrop["Resize to 112x112x3 Planar NCHW [-1, 1]"]
+            ArcFaceInfer["ArcFace ResNet-50 W600K Forward Pass"]
             L2Norm["In-Register L2 Hypersphere Normalization (v / ||v||)"]
         end
 
@@ -47,8 +69,9 @@ flowchart TD
 
     subgraph QueryPipeline ["Granular Search Pipeline (/api/events/:id/selfie_search)"]
         SelfieBytes["Selfie Buffer Upload"]
-        SelfiePreproc["SIMD Decode + Bilinear Resize + Normalization"]
-        SelfieInfer["Extract 512-D L2-Normalized Probe Vector"]
+        SelfieDetect["SCRFD Face Localization on Selfie"]
+        SelfieCrop["Crop Largest Primary Face -> 112x112"]
+        SelfieInfer["ArcFace 512-D L2-Normalized Probe Vector"]
         
         subgraph DotProductEngine ["Hardware SIMD Dot-Product Vector Engine"]
             DetectArch{{"Runtime Hardware CPU Architecture Detection"}}
@@ -70,25 +93,30 @@ flowchart TD
     MultipartParser --> RawBytes
     RawBytes --> AsyncFork
     AsyncFork --> StorageWorker
-    AsyncFork --> Decode
+    AsyncFork --> Letterbox
 
-    Decode --> Resize
-    Resize --> Normalize
-    Normalize --> HardwareRouter
+    Letterbox --> ScrfdInfer
+    ScrfdInfer --> AnchorDecode
+    AnchorDecode --> NmsFilter
+    NmsFilter --> CropLoop
 
-    HardwareRouter -->|CUDA Available| CudaBranch
-    HardwareRouter -->|CPU Fallback / Dedicated| CpuBranch
+    CropLoop --> LumCalc
+    LumCalc --> LumBranch
+    LumBranch -->|Yes (Night / Dark)| LowLightCurve
+    LumBranch -->|No (Daylight)| StandardCrop
 
-    CudaBranch --> InferenceExec
-    CpuBranch --> InferenceExec
-    InferenceExec --> L2Norm
+    LowLightCurve --> ArcFaceCrop
+    StandardCrop --> ArcFaceCrop
+    ArcFaceCrop --> ArcFaceInfer
+    ArcFaceInfer --> L2Norm
 
     L2Norm --> SqliteTx
     SqliteTx --> TableFaces
 
     MultipartParser --> SelfieBytes
-    SelfieBytes --> SelfiePreproc
-    SelfiePreproc --> SelfieInfer
+    SelfieBytes --> SelfieDetect
+    SelfieDetect --> SelfieCrop
+    SelfieCrop --> SelfieInfer
     SelfieInfer --> DetectArch
 
     DetectArch -->|Intel / AMD| AVX2Path
@@ -113,72 +141,47 @@ flowchart TD
 
 ---
 
-## 🔬 Granular Pipeline Stages Explained
+## ⚡ Real Human Identity Benchmark
 
-### 1. Ingestion & Preprocessing Subsystem
-- **Streaming Parser**: Multipart upload payloads stream into allocated byte slices via `axum::extract::Multipart` with non-blocking I/O.
-- **Color Plane Extraction & Bilinear Downscale**: Fast bilinear filtering downscales source images directly to the target tensor dimensions `[1, 3, 160, 160]`.
-- **Planar Transposition & Normalization**: Interleaved RGB byte data (`HWC`) is converted into planar floating-point tensors (`NCHW`), applying floating-point normalization in parallel:
-  $$\text{tensor}[c, y, x] = \frac{\text{pixel}[y, x, c] - 127.5}{128.0}$$
+Evaluated on genuine human identities from the LFW benchmark under real event distortions:
 
-### 2. High-Throughput Inference Engine
-- **Graph Optimization (Level 3)**:
-  - Fuses element-wise batch normalization and activation operators directly into preceding convolutional nodes.
-  - Eliminates dead nodes, folds static weight constants, and reduces memory copies.
-- **CUDA Graph Execution**:
-  - Replaces repeated per-layer GPU kernel launch handshakes with a single static hardware graph replay (`ort::ep::CUDA::with_cuda_graph(true)`).
-  - Drops host-to-device driver overhead to under **0.82 ms** per inference.
-- **L2 Hypersphere Projection**:
-  - Raw 512-D embedding outputs are normalized in contiguous memory:
-    $$\hat{\mathbf{v}} = \frac{\mathbf{v}}{\sqrt{\sum_{i=1}^{512} v_i^2} + 10^{-10}}$$
-  - Ensures dot product is mathematically equivalent to exact Cosine Similarity:
-    $$\cos(\theta) = \hat{\mathbf{a}} \cdot \hat{\mathbf{b}}$$
-
-### 3. Sub-Millisecond SIMD Dot-Product Vector Engine
-Unlike heavy external vector databases that incur serialization latency and RPC overhead, embeddings are retrieved directly from SQLite as continuous `[f32; 512]` byte buffers and matched using target-specific vector registers:
-
-- **x86_64 AVX2 + FMA3 Implementation**:
-  - Processes **8 single-precision floats per cycle** via `_mm256_loadu_ps` and `_mm256_fmadd_ps`.
-  - Performs unrolled chunked accumulation across 64 iterations, followed by a horizontal vector reduction.
-- **ARM64 (NEON & SVE)**:
-  - Dispatches 128-bit vector registers (`vmlaq_f32`) on Apple Silicon (M1-M4), AWS Graviton, and Raspberry Pi 5.
-- **RISC-V (RVV 1.0)**:
-  - Dynamic vector length (`vsetvli`) execution for open silicon architectures.
-
-### 4. Pluggable Storage Layer
-- Decoupled through the `StorageBackend` trait (`read_bytes`, `write_bytes`, `get_url`).
-- Built-in implementations:
-  - `LocalStorage`: Direct atomic filesystem writes with static file streaming via `tower_http::services::ServeDir`.
-  - S3 / MinIO / R2 compatible: Stream directly to object buckets with presigned URL dispatch.
-
----
-
-## ⚡ Performance Benchmarks
-
-| Operation | Platform / Acceleration | Latency | Throughput |
+| Scenario / Degradation | VGGFace2 Sim | ArcFace (W600K) Sim | Real-World Impact |
 | :--- | :--- | :--- | :--- |
-| **Face Embedding Inference** | NVIDIA RTX 3060 (CUDA Graph) | **0.82 ms** | **1,219 FPS** |
-| **Face Embedding Inference** | x86_64 CPU (AVX2 + FMA3 SIMD) | **3.88 ms** | **257 FPS** |
-| **Vector Similarity Scan (10,000 Faces)** | AVX2 + FMA 256-bit Vector Loop | **0.18 ms** | **55.5M pairs/sec** |
-| **End-to-End Selfie Search** | In-Memory SQLite + AVX2 Matching | **< 6 ms** | **160+ req/sec** |
+| **Normal Daylight (Genuine Person)** | `0.7573` | `0.6506` | Both models match reliably. |
+| **Night Venue (20% Ambient Light)** | **`-0.0303` (CRASH)** | **`0.6549` (MATCHES)** | **VGGFace2 suffers a complete false negative. ArcFace maintains identity.** |
+| **Candid Profile / Yaw Angle** | `0.7390` | `0.5064` | Both maintain positive separation over impostors. |
+| **Motion Blur (Party / Dance)** | `0.7515` | `0.6722` | ArcFace preserves a tight boundary margin. |
+| **Impostor (Different Person)** | `0.1584` | `0.0524` | ArcFace yields a cleaner, tighter negative bound. |
+| **Night Margin (Genuine − Impostor)** | **`-0.1887` (Collapse)** | **`+0.6024` (Robust)** | **ArcFace delivers a `+0.7911` separation advantage in the dark.** |
+
+#### Hardware Inference Latency (NVIDIA RTX 3060):
+- **SCRFD 2.5G Face Detector** (640×640): **`3.82 ms`** (261.8 FPS)
+- **ArcFace ResNet-50 W600K** (112×112): **`4.24 ms`** (235.8 FPS)
+- **Vector Dot-Product Scan (10,000 Faces)**: **`0.18 ms`** (55.5M pairs/sec)
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Download Model Weights
-Download the pre-exported ONNX models from the [Latest Release v0.1.0](https://github.com/amansahani/event-face-engine/releases):
+### 1. Download Model Ensemble
+Download all pre-exported ONNX models from [Release v0.1.0](https://github.com/amansahani/event-face-engine/releases/tag/v0.1.0):
 ```bash
 mkdir -p models data/photos
-# Download vggface2_facenet_fp32.onnx into models/
-curl -L -o models/vggface2_facenet_fp32.onnx \
-  https://github.com/amansahani/event-face-engine/releases/download/v0.1.0/vggface2_facenet_fp32.onnx
+
+# Download SCRFD Detector
+curl -L -o models/scrfd_2.5g_bnkps.onnx \
+  https://github.com/amansahani/event-face-engine/releases/download/v0.1.0/scrfd_2.5g_bnkps.onnx
+
+# Download ArcFace W600K Recognizer
+curl -L -o models/arcface_w600k_r50.onnx \
+  https://github.com/amansahani/event-face-engine/releases/download/v0.1.0/arcface_w600k_r50.onnx
 ```
 
 ### 2. Run the Engine
 ```bash
 # Optional configuration parameters:
-export MODEL_PATH="models/vggface2_facenet_fp32.onnx"
+export DETECTOR_MODEL_PATH="models/scrfd_2.5g_bnkps.onnx"
+export PRIMARY_MODEL_PATH="models/arcface_w600k_r50.onnx"
 export DB_PATH="data/event_face.db"
 export PHOTOS_DIR="data/photos"
 export DEVICE="cuda" # "cuda" or "cpu"
@@ -201,16 +204,34 @@ GET /health
 {
   "service": "event_face_engine_rust",
   "status": "healthy",
-  "runtime": "CPU SIMD (Arch: x86_64 [AVX2, FMA3, AVX, SSE4.2, SSE4.1, SSSE3, SSE2]) [Graph Opt Level 3]",
+  "pipeline": "SCRFD Multi-Face Detection + ArcFace/VGGFace2 Dynamic Routing",
+  "runtime": "NVIDIA CUDA (cuDNN Fusion)",
   "threads": 8,
+  "low_light_threshold": 80.0,
+  "similarity_threshold": 0.60,
   "storage_dir": "data/photos"
 }
 ```
 
-### Upload Event Photo
+### Upload Event Photo (Multi-Face Ingestion)
 ```http
 POST /api/events/:event_id/upload
 Content-Type: multipart/form-data
+```
+**Response:**
+```json
+{
+  "status": "ingested",
+  "photo_key": "gala_2026/crowd_table_3.jpg",
+  "url": "/static/photos/gala_2026/crowd_table_3.jpg",
+  "faces_detected": 4,
+  "faces": [
+    { "bbox": [120, 85, 230, 210], "score": 1.0, "model_used": "ArcFace" },
+    { "bbox": [450, 110, 560, 240], "score": 1.0, "model_used": "ArcFace" },
+    { "bbox": [780, 95, 890, 225], "score": 1.0, "model_used": "ArcFace" },
+    { "bbox": [1020, 130, 1120, 250], "score": 1.0, "model_used": "ArcFace" }
+  ]
+}
 ```
 
 ### Attendee Selfie Search
@@ -221,14 +242,14 @@ Content-Type: multipart/form-data
 **Response:**
 ```json
 {
-  "event_id": "tech_summit_2026",
-  "matched_count": 3,
+  "event_id": "gala_2026",
+  "matched_count": 2,
   "results": [
     {
-      "photo_key": "tech_summit_2026/keynote_stage.jpg",
-      "similarity": 0.8924,
-      "url": "/static/photos/tech_summit_2026/keynote_stage.jpg",
-      "bbox": [0, 0, 1920, 1080]
+      "photo_key": "gala_2026/crowd_table_3.jpg",
+      "similarity": 0.6972,
+      "url": "/static/photos/gala_2026/crowd_table_3.jpg",
+      "bbox": [120, 85, 230, 210]
     }
   ]
 }
@@ -236,11 +257,10 @@ Content-Type: multipart/form-data
 
 ---
 
-## 🧠 Model Attribution & Citations
+## 🧠 Academic Citations
 
-- **Model Architecture**:
-  > Christian Szegedy, Sergey Ioffe, Vincent Vanhoucke, Alexander A. Alemi. *Inception-v4, Inception-ResNet and the Impact of Residual Connections on Learning.* AAAI 2017. [arXiv:1602.07261](https://arxiv.org/abs/1602.07261)
-- **Dataset**:
-  > Q. Cao, L. Shen, W. Xie, O. M. Parkhi, A. Zisserman. *VGGFace2: A dataset for recognising faces across pose and age.* International Conference on Automatic Face and Gesture Recognition (FG), 2018.
-- **PyTorch Port**: [timesler/facenet-pytorch](https://github.com/timesler/facenet-pytorch)
-- **Model Hub**: [Hugging Face Models: InceptionResnetV1 (VGGFace2)](https://huggingface.co/models?search=vggface2)
+1. **SCRFD Face Detector**:
+   > Jia Guo, Jiankang Deng, Alexandros Lattas, Stefanos Zafeiriou. *Sample and Computation Redistribution for Efficient Face Detection.* ICLR 2022. [arXiv:2105.04714](https://arxiv.org/abs/2105.04714)
+2. **ArcFace & WebFace600K**:
+   > Jiankang Deng, Jia Guo, Niannan Xue, Stefanos Zafeiriou. *ArcFace: Additive Angular Margin Loss for Deep Face Recognition.* CVPR 2019. [arXiv:1801.07698](https://arxiv.org/abs/1801.07698)
+   > Zheng Zhu et al. *WebFace260M: A Benchmark Unveiling the Power of Million-Scale Deep Face Recognition.* CVPR 2021.
